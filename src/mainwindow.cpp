@@ -74,6 +74,13 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
+    m_appPollTimer->stop();
+    m_connCheckTimer->stop();
+    m_audioSyncTimer->stop();
+    // Stop hardware while the UI and channel state are still alive. QObject
+    // deletes child managers only after MainWindow's members are destroyed.
+    disconnect(m_hwManager, nullptr, this, nullptr);
+    m_hwManager->disconnectDevice();
     delete ui;
 }
 
@@ -227,6 +234,9 @@ void MainWindow::onAppAssignmentChanged(int channelId, const QString& appName)
     // Save to database when user changes dropdown
     qDebug() << "Channel" << channelId << "assigned to" << appName;
     m_dbManager->setChannelApp(channelId, appName);
+    if (channelId >= 0 && channelId < m_lastComValues.size()) {
+        m_lastComValues[channelId] = -1;
+    }
 }
 
 void MainWindow::refreshAudioSessions()
@@ -238,6 +248,10 @@ void MainWindow::refreshAudioSessions()
     for(auto* strip : m_channelStrips) {
         strip->populateApps(activeApps);
     }
+    // A stream may have been recreated even if its application name is the
+    // same. Reapply physical levels on each poll so it resumes without a turn
+    // of the knob. This also retries channels whose apps were previously absent.
+    m_lastComValues.fill(-1);
 }
 
 void MainWindow::updateDynamicChannels(int count)

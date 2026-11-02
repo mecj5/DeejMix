@@ -9,6 +9,12 @@
 struct IAudioSessionManager2;
 struct IAudioSessionEnumerator;
 
+#ifdef Q_OS_LINUX
+// Forward declarations for PulseAudio to keep the header clean
+struct pa_mainloop;
+struct pa_context;
+#endif
+
 class AudioManager : public QObject
 {
     Q_OBJECT
@@ -25,6 +31,13 @@ public:
 
     // Enumeration
     QStringList getActiveAudioSessions();
+
+#ifdef Q_OS_LINUX
+    // Exposed so the Linux backend helper functions (defined in audiomanager.cpp,
+    // the same translation unit) can drive the PulseAudio context/mainloop.
+    pa_mainloop *m_pulseMainloop = nullptr;
+    pa_context  *m_pulseContext  = nullptr;
+#endif
 
 signals:
     void sessionListChanged(const QStringList& sessions);

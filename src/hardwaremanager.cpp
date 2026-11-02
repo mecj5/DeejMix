@@ -1,6 +1,7 @@
 #include "hardwaremanager.h"
 #include <QSerialPortInfo>
 #include <QDebug>
+#include <QSignalBlocker>
 
 HardwareManager::HardwareManager(QObject *parent) 
     : QObject(parent), m_serial(new QSerialPort(this)), m_currentPortIndex(0), m_currentBaudIndex(0), m_isSniffing(false), m_isConnected(false)
@@ -17,6 +18,9 @@ HardwareManager::HardwareManager(QObject *parent)
 
 HardwareManager::~HardwareManager()
 {
+    // Never notify a parent window from a child destructor: its UI may already
+    // have been destroyed by the time QObject deletes this manager.
+    const QSignalBlocker blocker(this);
     disconnectDevice();
 }
 
@@ -27,19 +31,23 @@ void HardwareManager::startAutoDetect()
     m_isSniffing = true;
     m_currentPortIndex = 0;
     m_currentBaudIndex = 0;
-    attemptConnection();
+    // Start after the current event has finished, including when restarting
+    // from a serial error callback. A subsequent disconnect cancels the probe.
+    QTimer::singleShot(0, this, &HardwareManager::attemptConnection);
 }
 
 void HardwareManager::disconnectDevice()
 {
-    if (m_serial->isOpen()) {
-        m_serial->close();
-    }
+    const bool wasConnected = m_isConnected;
     m_isConnected = false;
     m_isSniffing = false;
     m_scanTimer->stop();
     m_readTimer->stop();
-    emit hardwareDisconnected();
+    const QSignalBlocker serialBlocker(m_serial);
+    if (m_serial->isOpen()) {
+        m_serial->close();
+    }
+    if (wasConnected) emit hardwareDisconnected();
 }
 
 bool HardwareManager::isConnected() const
@@ -49,7 +57,7 @@ bool HardwareManager::isConnected() const
 
 void HardwareManager::attemptConnection()
 {
-    if (m_isConnected) return;
+    if (m_isConnected || !m_isSniffing) return;
     
     if (m_serial->isOpen()) {
         m_serial->close();
@@ -154,9 +162,11 @@ void HardwareManager::processLine(const QString& line)
 
 void HardwareManager::onPortError(QSerialPort::SerialPortError error)
 {
-    if (error == QSerialPort::ResourceError) {
+    if (error == QSerialPort::ResourceError && m_isConnected) {
         disconnectDevice();
         // Always resume scanning if we lost connection unexpectedly!
+        // Failed probes are handled by attemptConnection/connectionTimeout.
+        // startAutoDetect queues the scan rather than re-entering serial I/O.
         startAutoDetect();
     }
 }

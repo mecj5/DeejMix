@@ -4,6 +4,7 @@
 #include <QStyle>
 #include <QFileIconProvider>
 #include <QFileInfo>
+#include <QSignalBlocker>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -70,10 +71,8 @@ void ChannelStrip::setupUi()
 
     m_appDropdown = new QComboBox(this);
     m_appDropdown->addItem("Select App...");
-    connect(m_appDropdown, &QComboBox::currentTextChanged, [this](const QString& text){
-        if (text != "Select App...") {
-            emit appAssignmentChanged(m_channelId, text);
-        }
+    connect(m_appDropdown, &QComboBox::currentTextChanged, this, [this]{
+        emit appAssignmentChanged(m_channelId, getAssignedApp());
         updateAppIcon();
     });
 
@@ -130,7 +129,6 @@ void ChannelStrip::setVisualMode(bool isKnob)
 {
     m_isKnobMode = isKnob;
     m_visualStack->setCurrentIndex(isKnob ? 1 : 0);
-    m_appDropdown->setVisible(!isKnob);
 }
 
 void ChannelStrip::setAccentColor(const QColor& color)
@@ -198,24 +196,28 @@ void ChannelStrip::updateVolume(int volume)
 
 void ChannelStrip::populateApps(const QStringList& apps)
 {
-    QString current = m_appDropdown->currentText();
+    const QString current = getAssignedApp();
 
-    m_appDropdown->blockSignals(true);
+    const QSignalBlocker blocker(m_appDropdown);
     m_appDropdown->clear();
     m_appDropdown->addItem("Select App...");
     m_appDropdown->addItem("[Master Volume]");
     m_appDropdown->addItem("[System Microphone]");
     m_appDropdown->addItems(apps);
 
-    int idx = m_appDropdown->findText(current);
-    if (idx != -1) {
+    if (!current.isEmpty()) {
+        int idx = m_appDropdown->findText(current);
+        if (idx == -1) {
+            // A channel assignment outlives an application's playback stream.
+            m_appDropdown->addItem(current);
+            idx = m_appDropdown->count() - 1;
+            m_appDropdown->setItemData(idx,
+                "Not currently playing. This assignment is kept until you change it.",
+                Qt::ToolTipRole);
+        }
         m_appDropdown->setCurrentIndex(idx);
-    } else {
-        // If the previous app is gone, we still might want to keep its text around
-        // but for now we let it fall back to "Select App..."
-        m_appDropdown->setCurrentIndex(0);
     }
-    m_appDropdown->blockSignals(false);
+    updateAppIcon();
 }
 
 QString ChannelStrip::getAssignedApp() const
@@ -226,9 +228,12 @@ QString ChannelStrip::getAssignedApp() const
 
 void ChannelStrip::setAssignedApp(const QString& appName)
 {
-    if (appName.isEmpty()) return;
-
-    m_appDropdown->blockSignals(true);
+    const QSignalBlocker blocker(m_appDropdown);
+    if (appName.isEmpty()) {
+        m_appDropdown->setCurrentIndex(0);
+        updateAppIcon();
+        return;
+    }
     int idx = m_appDropdown->findText(appName);
     if (idx != -1) {
         m_appDropdown->setCurrentIndex(idx);
@@ -236,7 +241,6 @@ void ChannelStrip::setAssignedApp(const QString& appName)
         m_appDropdown->addItem(appName);
         m_appDropdown->setCurrentText(appName);
     }
-    m_appDropdown->blockSignals(false);
 
     updateAppIcon();
 }

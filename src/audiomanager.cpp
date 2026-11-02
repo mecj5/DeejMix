@@ -1,6 +1,12 @@
 #include "audiomanager.h"
 #include <QDebug>
 
+#ifdef Q_OS_LINUX
+#include <pulse/pulseaudio.h>
+#include <QHash>
+#include <QVector>
+#endif
+
 #ifdef Q_OS_WIN
 #include <windows.h>
 #include <mmdeviceapi.h>
@@ -35,6 +41,137 @@ float linearToLogarithmic(float linearValue) {
 
 #endif
 
+#ifdef Q_OS_LINUX
+// ─────────────────────────────────────────────────────────────────────────────
+// Linux audio backend: PulseAudio / PipeWire (via its pulse-compat server).
+//
+// On Linux there is no per-PID "audio session" concept like Windows WASAPI.
+// Instead, each running application appears as a PulseAudio *sink input* whose
+// `application.name` property identifies it. We enumerate the default sink's
+// sink inputs and set volume per input. This single code path works against
+// both classic PulseAudio and PipeWire (which speaks the PulseAudio protocol).
+//
+// We use a small synchronous helper pattern: spin the PulseAudio mainloop until
+// a request's reply arrives. This keeps the AudioManager API identical to the
+// Windows build (simple blocking calls), which is what MainWindow expects.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Synchronously run the PulseAudio main loop until the given operation
+// finishes (or a generous iteration budget is reached, as a safety net).
+// Uses BLOCKING iteration so each call returns as soon as the server's
+// reply arrives, which is far more reliable than a fixed count of
+// non-blocking iterations (that can exhaust its budget before the reply
+// is even readable from the socket).
+static bool pa_spin_op(AudioManager *am, pa_operation *op, int maxIters = 2000) {
+    if (!am || !op || !am->m_pulseMainloop) return false;
+    int ret = 0;
+    for (int i = 0; i < maxIters; ++i) {
+        if (pa_operation_get_state(op) != PA_OPERATION_RUNNING) break;
+        pa_mainloop_iterate(am->m_pulseMainloop, 1, &ret);
+        if (ret != 0) break;
+    }
+    const bool done = (pa_operation_get_state(op) == PA_OPERATION_DONE);
+    pa_operation_unref(op);
+    return done;
+}
+
+// Wait until the context becomes READY (or FAILED).
+static bool pa_spin_until_ready(AudioManager *am) {
+    if (!am || !am->m_pulseContext || !am->m_pulseMainloop) return false;
+    for (int i = 0; i < 20000; ++i) {
+        pa_context_state_t st = pa_context_get_state(am->m_pulseContext);
+        if (st == PA_CONTEXT_READY) return true;
+        if (st == PA_CONTEXT_FAILED) return false;
+        int ret = 0;
+        pa_mainloop_iterate(am->m_pulseMainloop, 1, &ret);
+        if (ret != 0) break;
+    }
+    return false;
+}
+
+// Query the server for the default sink/source names (there is no dedicated
+// getter in this PulseAudio build, so we read pa_server_info).
+struct PaDefaultDevices {
+    QString defaultSink;
+    QString defaultSource;
+};
+
+static void pa_server_info_cb(pa_context *c, const pa_server_info *si, void *userdata) {
+    Q_UNUSED(c);
+    auto *res = static_cast<PaDefaultDevices *>(userdata);
+    if (si->default_sink_name) res->defaultSink = QString::fromUtf8(si->default_sink_name);
+    if (si->default_source_name) res->defaultSource = QString::fromUtf8(si->default_source_name);
+}
+
+static bool pa_get_default_devices(AudioManager *am, PaDefaultDevices *res) {
+    pa_operation *op = pa_context_get_server_info(am->m_pulseContext, pa_server_info_cb, res);
+    if (op && !pa_spin_op(am, op)) return false;
+    return !res->defaultSink.isEmpty() || !res->defaultSource.isEmpty();
+}
+
+// Build a stable, human-readable identifier for a sink input, matching the
+// convention used by getActiveAudioSessions().
+static QString pa_sink_input_name(const pa_sink_input_info *si) {
+    if (si->proplist) {
+        const char *appName = pa_proplist_gets(si->proplist, "application.name");
+        if (appName && *appName) return QString::fromUtf8(appName);
+        const char *mediaName = pa_proplist_gets(si->proplist, "media.name");
+        const char *mediaRole = pa_proplist_gets(si->proplist, "media.role");
+        if (mediaName && mediaRole)
+            return QString::fromUtf8(mediaRole) + " - " + QString::fromUtf8(mediaName);
+        if (mediaName) return QString::fromUtf8(mediaName);
+    }
+    if (si->name && *si->name) return QString::fromUtf8(si->name);
+    return QString();
+}
+
+struct PaInputEntry {
+    uint32_t index;
+    QString name;
+};
+
+static void pa_sink_inputs_cb(pa_context *c, const pa_sink_input_info *sii, int eol, void *userdata) {
+    Q_UNUSED(c);
+    if (eol) return;
+    auto *out = static_cast<QVector<PaInputEntry> *>(userdata);
+    out->append(PaInputEntry{ sii->index, pa_sink_input_name(sii) });
+}
+
+// Snapshot every sink input on the server (index + resolved app name).
+static QVector<PaInputEntry> pa_get_sink_inputs(AudioManager *am) {
+    QVector<PaInputEntry> out;
+    pa_operation *op = pa_context_get_sink_input_info_list(am->m_pulseContext, pa_sink_inputs_cb, &out);
+    if (op && !pa_spin_op(am, op)) out.clear();
+    return out;
+}
+
+// Collect the deduplicated list of application names from every sink input.
+static QStringList pa_active_app_names(AudioManager *am) {
+    QStringList apps;
+    for (const PaInputEntry &e : pa_get_sink_inputs(am)) {
+        if (!e.name.isEmpty() && !apps.contains(e.name)) apps.append(e.name);
+    }
+    return apps;
+}
+
+// Find a sink input index whose name matches `targetName`.
+static uint32_t pa_find_input_by_name(AudioManager *am, const QString &targetName) {
+    for (const PaInputEntry &e : pa_get_sink_inputs(am)) {
+        if (e.name == targetName) return e.index;
+    }
+    return PA_INVALID_INDEX;
+}
+
+static void pa_set_input_volume(AudioManager *am, uint32_t inputIdx, float volume) {
+    pa_cvolume cvol;
+    pa_cvolume_init(&cvol);
+    pa_cvolume_set(&cvol, 2, (uint32_t)(qBound(0.0f, volume, 1.0f) * PA_VOLUME_NORM));
+    pa_operation *op = pa_context_set_sink_input_volume(am->m_pulseContext, inputIdx, &cvol, nullptr, nullptr);
+    pa_spin_op(am, op);
+}
+
+#endif
+
 AudioManager::AudioManager(QObject *parent) : QObject(parent), m_initialized(false)
 {
 }
@@ -45,6 +182,10 @@ AudioManager::~AudioManager()
     if (m_initialized) {
         CoUninitialize();
     }
+#endif
+#ifdef Q_OS_LINUX
+    if (m_pulseContext)  pa_context_unref(m_pulseContext);
+    if (m_pulseMainloop) pa_mainloop_free(m_pulseMainloop);
 #endif
 }
 
@@ -58,6 +199,37 @@ bool AudioManager::initialize()
         return false;
     }
     m_initialized = true;
+    return true;
+#elif defined(Q_OS_LINUX)
+    if (m_initialized) return true;
+
+    m_pulseMainloop = pa_mainloop_new();
+    if (!m_pulseMainloop) {
+        qWarning() << "Failed to create PulseAudio mainloop";
+        return false;
+    }
+
+    m_pulseContext = pa_context_new(pa_mainloop_get_api(m_pulseMainloop), "DeejMix");
+    if (!m_pulseContext) {
+        qWarning() << "Failed to create PulseAudio context";
+        pa_mainloop_free(m_pulseMainloop);
+        m_pulseMainloop = nullptr;
+        return false;
+    }
+
+    pa_context_connect(m_pulseContext, nullptr, PA_CONTEXT_NOFLAGS, 0);
+
+    if (!pa_spin_until_ready(this)) {
+        qWarning() << "PulseAudio context failed to reach READY state";
+        pa_context_unref(m_pulseContext);
+        m_pulseContext = nullptr;
+        pa_mainloop_free(m_pulseMainloop);
+        m_pulseMainloop = nullptr;
+        return false;
+    }
+
+    m_initialized = true;
+    qDebug() << "[AudioManager] Linux PulseAudio initialized (client=DeejMix)";
     return true;
 #else
     return false;
@@ -115,6 +287,12 @@ void AudioManager::setAppVolume(const QString& appName, float volume, bool useLo
         }
     }
     sessionEnumerator->Release();
+#elif defined(Q_OS_LINUX)
+    float finalVolume = qBound(0.0f, volume, 1.0f);
+    uint32_t in = pa_find_input_by_name(this, appName);
+    if (in != PA_INVALID_INDEX) {
+        pa_set_input_volume(this, in, finalVolume);
+    }
 #endif
 }
 
@@ -149,6 +327,17 @@ void AudioManager::setMasterVolume(float volume, bool useLogarithmic)
     endpointVolume->Release();
     defaultDevice->Release();
     deviceEnumerator->Release();
+#elif defined(Q_OS_LINUX)
+    float finalVolume = qBound(0.0f, volume, 1.0f);
+    PaDefaultDevices dev;
+    if (pa_get_default_devices(this, &dev) && !dev.defaultSink.isEmpty()) {
+        pa_cvolume cvol;
+        pa_cvolume_init(&cvol);
+        pa_cvolume_set(&cvol, 2, (uint32_t)(finalVolume * PA_VOLUME_NORM));
+        pa_operation *op = pa_context_set_sink_volume_by_name(m_pulseContext,
+            dev.defaultSink.toUtf8().constData(), &cvol, nullptr, nullptr);
+        pa_spin_op(this, op);
+    }
 #endif
 }
 
@@ -183,6 +372,18 @@ void AudioManager::setMicrophoneVolume(float volume, bool useLogarithmic)
     endpointVolume->Release();
     defaultDevice->Release();
     deviceEnumerator->Release();
+#elif defined(Q_OS_LINUX)
+    float finalVolume = qBound(0.0f, volume, 1.0f);
+    PaDefaultDevices dev;
+    if (pa_get_default_devices(this, &dev) && !dev.defaultSource.isEmpty()) {
+        pa_cvolume cvol;
+        pa_cvolume_init(&cvol);
+        pa_cvolume_set(&cvol, 2, (uint32_t)(finalVolume * PA_VOLUME_NORM));
+        QByteArray name = dev.defaultSource.toUtf8();
+        pa_operation *op = pa_context_set_source_volume_by_name(m_pulseContext,
+            name.constData(), &cvol, nullptr, nullptr);
+        pa_spin_op(this, op);
+    }
 #endif
 }
 
@@ -235,7 +436,10 @@ QStringList AudioManager::getActiveAudioSessions()
     }
     sessionEnumerator->Release();
     apps.sort(Qt::CaseInsensitive);
+#elif defined(Q_OS_LINUX)
+    apps = pa_active_app_names(this);
+    apps.sort(Qt::CaseInsensitive);
 #endif
-    
+
     return apps;
 }
