@@ -1,6 +1,7 @@
 #include <QtTest>
 #include <QSignalSpy>
 #include <QTemporaryDir>
+#include <QStatusBar>
 #include "channelstrip.h"
 #include "databasemanager.h"
 #include "hardwaremanager.h"
@@ -117,6 +118,60 @@ private slots:
         });
         QCOMPARE(qApp->exec(), 0);
         // Destruction used to emit hardwareDisconnected into a destroyed UI.
+    }
+
+    void trayRefreshKeepsAssignmentsWhileHidden()
+    {
+        MainWindow window;
+        auto *hardware = window.findChild<HardwareManager *>();
+        auto *db = window.findChild<DatabaseManager *>();
+        auto *tray = window.findChild<QSystemTrayIcon *>();
+        QVERIFY(hardware);
+        QVERIFY(db);
+        QVERIFY(tray);
+        QVERIFY(tray->contextMenu());
+        hardware->disconnectDevice();
+        db->setChannelApp(0, "Music");
+        db->setChannelApp(1, "[Master Volume]");
+        window.hide();
+
+        QAction *refresh = nullptr;
+        for (auto *action : tray->contextMenu()->actions()) {
+            if (action->text() == "Refresh") refresh = action;
+        }
+        QVERIFY(refresh);
+
+        for (int i = 0; i < 3; ++i) {
+            refresh->trigger();
+            // Cancel detection before processing events to avoid real hardware.
+            hardware->disconnectDevice();
+            QCoreApplication::processEvents();
+            QVERIFY(!window.isVisible());
+            QCOMPARE(db->getChannelApp(0), QString("Music"));
+            QCOMPARE(db->getChannelApp(1), QString("[Master Volume]"));
+            QVERIFY(!window.statusBar()->currentMessage().isEmpty());
+#ifdef Q_OS_LINUX
+            // An unavailable audio server must report failure without blocking
+            // subsequent Refresh attempts or removing the assignments.
+            QVERIFY(window.statusBar()->currentMessage().contains("Audio unavailable"));
+#endif
+        }
+    }
+
+    void audioRefreshCanRetryAfterFailure()
+    {
+#ifdef Q_OS_LINUX
+        AudioManager audio;
+        QVERIFY(!audio.initialize());
+        for (int i = 0; i < 3; ++i) {
+            QVERIFY(!audio.refresh());
+            QVERIFY(audio.getActiveAudioSessions().isEmpty());
+            QVERIFY(audio.m_pulseContext == nullptr);
+            QVERIFY(audio.m_pulseMainloop == nullptr);
+        }
+#else
+        QSKIP("Audio-server failure recovery is specific to the Linux backend.");
+#endif
     }
 };
 

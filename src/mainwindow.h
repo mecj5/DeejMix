@@ -39,6 +39,7 @@ private slots:
     void onSliderValuesReceived(const QVector<int>& values);
     void checkHardwareConnection();
     void refreshAudioSessions();
+    void refreshDevices();
     void iconActivated(QSystemTrayIcon::ActivationReason reason);
     void trayQuit();
     void onAppAssignmentChanged(int channelId, const QString& appName);

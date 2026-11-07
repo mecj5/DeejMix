@@ -23,6 +23,7 @@ public:
     ~AudioManager();
 
     bool initialize();
+    bool refresh();
     
     // Core control
     void setAppVolume(const QString& appName, float volume, bool useLogarithmic = false);
@@ -45,6 +46,7 @@ signals:
 
 private:
     bool m_initialized;
+    void shutdown();
     
     // Internal COM helper functions will go here
 };

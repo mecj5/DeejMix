@@ -76,6 +76,8 @@ On Linux, your user must have permission to access the controller's serial devic
 
 An assigned application stays selected while its audio stream is absent. When it returns, DeejMix reapplies the physical control's volume on the next audio poll (about two seconds). Choose another application to replace an assignment, or choose **Select App...** to clear it.
 
+After changing audio adapters or reconnecting hardware, right-click the DeejMix system tray icon and choose **Refresh**. This refreshes the audio connection and application list and restarts hardware detection, keeping your saved channel assignments. Master output and microphone controls follow your operating system's current default devices. If the audio server is unavailable, choose **Refresh** again once it is running.
+
 ## Local settings
 
 DeejMix stores `deejmix.db` in the application data directory selected by Qt for your operating system. It holds settings and channel assignments and is separate from the source directory.

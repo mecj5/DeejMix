@@ -315,10 +315,14 @@ void MainWindow::setupTrayIcon()
     QAction* restoreAction = new QAction("Show DeejMix", this);
     connect(restoreAction, &QAction::triggered, this, &QWidget::showNormal);
 
+    QAction* refreshAction = new QAction("Refresh", this);
+    connect(refreshAction, &QAction::triggered, this, &MainWindow::refreshDevices);
+
     QAction* quitAction = new QAction("Quit", this);
     connect(quitAction, &QAction::triggered, this, &MainWindow::trayQuit);
 
     m_trayIconMenu->addAction(restoreAction);
+    m_trayIconMenu->addAction(refreshAction);
     m_trayIconMenu->addSeparator();
     m_trayIconMenu->addAction(quitAction);
 
@@ -352,6 +356,26 @@ void MainWindow::iconActivated(QSystemTrayIcon::ActivationReason reason)
 void MainWindow::trayQuit()
 {
     QApplication::quit();
+}
+
+void MainWindow::refreshDevices()
+{
+    m_appPollTimer->stop();
+    m_audioSyncTimer->stop();
+    m_hwManager->disconnectDevice();
+
+    const bool audioReady = m_audioManager->refresh();
+    refreshAudioSessions();
+    m_hwManager->startAutoDetect();
+    m_appPollTimer->start();
+    m_audioSyncTimer->start();
+
+    const QString message = audioReady
+        ? "Audio refreshed. Scanning for hardware..."
+        : "Audio unavailable. Scanning for hardware; try Refresh again when audio is available.";
+    statusBar()->showMessage(message, 5000);
+    m_trayIcon->showMessage("DeejMix Refresh", message,
+        audioReady ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning, 4000);
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)

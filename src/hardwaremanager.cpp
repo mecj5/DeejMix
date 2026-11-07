@@ -9,6 +9,8 @@ HardwareManager::HardwareManager(QObject *parent)
     m_baudRates = {QSerialPort::Baud9600, QSerialPort::Baud115200};
     m_scanTimer = new QTimer(this);
     m_readTimer = new QTimer(this);
+    m_scanTimer->setSingleShot(true);
+    m_readTimer->setSingleShot(true);
     
     connect(m_serial, &QSerialPort::readyRead, this, &HardwareManager::onReadyRead);
     connect(m_serial, &QSerialPort::errorOccurred, this, &HardwareManager::onPortError);
@@ -33,7 +35,7 @@ void HardwareManager::startAutoDetect()
     m_currentBaudIndex = 0;
     // Start after the current event has finished, including when restarting
     // from a serial error callback. A subsequent disconnect cancels the probe.
-    QTimer::singleShot(0, this, &HardwareManager::attemptConnection);
+    m_scanTimer->start(0);
 }
 
 void HardwareManager::disconnectDevice()
@@ -43,6 +45,7 @@ void HardwareManager::disconnectDevice()
     m_isSniffing = false;
     m_scanTimer->stop();
     m_readTimer->stop();
+    m_buffer.clear();
     const QSignalBlocker serialBlocker(m_serial);
     if (m_serial->isOpen()) {
         m_serial->close();
@@ -87,8 +90,8 @@ void HardwareManager::attemptConnection()
     } else {
         m_currentBaudIndex = 0;
         m_currentPortIndex++;
-        // Use a QTimer::singleShot to yield back to event loop, preventing freeze!
-        QTimer::singleShot(10, this, &HardwareManager::attemptConnection);
+        // Yield to the event loop; disconnect/refresh can cancel this retry.
+        m_scanTimer->start(10);
     }
 }
 
@@ -106,7 +109,7 @@ void HardwareManager::connectionTimeout()
         }
         
         // Yield to event loop
-        QTimer::singleShot(10, this, &HardwareManager::attemptConnection);
+        m_scanTimer->start(10);
     }
 }
 

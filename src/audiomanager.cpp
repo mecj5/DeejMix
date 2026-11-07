@@ -154,14 +154,6 @@ static QStringList pa_active_app_names(AudioManager *am) {
     return apps;
 }
 
-// Find a sink input index whose name matches `targetName`.
-static uint32_t pa_find_input_by_name(AudioManager *am, const QString &targetName) {
-    for (const PaInputEntry &e : pa_get_sink_inputs(am)) {
-        if (e.name == targetName) return e.index;
-    }
-    return PA_INVALID_INDEX;
-}
-
 static void pa_set_input_volume(AudioManager *am, uint32_t inputIdx, float volume) {
     pa_cvolume cvol;
     pa_cvolume_init(&cvol);
@@ -178,15 +170,40 @@ AudioManager::AudioManager(QObject *parent) : QObject(parent), m_initialized(fal
 
 AudioManager::~AudioManager()
 {
+    shutdown();
+}
+
+void AudioManager::shutdown()
+{
 #ifdef Q_OS_WIN
     if (m_initialized) {
         CoUninitialize();
     }
 #endif
 #ifdef Q_OS_LINUX
-    if (m_pulseContext)  pa_context_unref(m_pulseContext);
-    if (m_pulseMainloop) pa_mainloop_free(m_pulseMainloop);
+    if (m_pulseContext) {
+        pa_context_disconnect(m_pulseContext);
+        pa_context_unref(m_pulseContext);
+        m_pulseContext = nullptr;
+    }
+    if (m_pulseMainloop) {
+        pa_mainloop_free(m_pulseMainloop);
+        m_pulseMainloop = nullptr;
+    }
 #endif
+    m_initialized = false;
+}
+
+bool AudioManager::refresh()
+{
+#ifdef Q_OS_LINUX
+    // Reconnect even if initialize() previously succeeded: the audio server
+    // may have restarted since then, leaving the old context unusable.
+    shutdown();
+#endif
+    // Windows reacquires endpoints and sessions on each query; retain its
+    // thread's COM initialization rather than repeatedly initializing it.
+    return m_initialized || initialize();
 }
 
 bool AudioManager::initialize()
@@ -289,9 +306,10 @@ void AudioManager::setAppVolume(const QString& appName, float volume, bool useLo
     sessionEnumerator->Release();
 #elif defined(Q_OS_LINUX)
     float finalVolume = qBound(0.0f, volume, 1.0f);
-    uint32_t in = pa_find_input_by_name(this, appName);
-    if (in != PA_INVALID_INDEX) {
-        pa_set_input_volume(this, in, finalVolume);
+    for (const PaInputEntry &input : pa_get_sink_inputs(this)) {
+        if (input.name == appName) {
+            pa_set_input_volume(this, input.index, finalVolume);
+        }
     }
 #endif
 }
